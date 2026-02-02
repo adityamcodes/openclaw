@@ -5,7 +5,8 @@ import type {
 } from "@mariozechner/pi-agent-core";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { ClientToolDefinition } from "./pi-embedded-runner/run/params.js";
-import { logDebug, logError } from "../logger.js";
+import { logDebug, logError, logWarn } from "../logger.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { runBeforeToolCallHook } from "./pi-tools.before-tool-call.js";
 import { normalizeToolName } from "./tool-policy.js";
 import { jsonResult } from "./tools/common.js";
@@ -31,6 +32,11 @@ type ToolExecuteArgs = ToolDefinition["execute"] extends (...args: infer P) => u
   ? P
   : ToolExecuteArgsCurrent;
 type ToolExecuteArgsAny = ToolExecuteArgs | ToolExecuteArgsLegacy | ToolExecuteArgsCurrent;
+
+export type ToolDefinitionHookContext = {
+  agentId?: string;
+  sessionKey?: string;
+};
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -81,7 +87,30 @@ function splitToolExecuteArgs(args: ToolExecuteArgsAny): {
   };
 }
 
-export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
+/** Fire after_tool_call hook (best-effort, non-blocking). */
+function fireAfterToolCall(
+  event: Record<string, unknown>,
+  ctx: Record<string, unknown>,
+  normalizedName: string,
+): void {
+  const hookRunner = getGlobalHookRunner();
+  if (
+    !hookRunner?.hasHooks("after_tool_call") ||
+    typeof hookRunner.runAfterToolCall !== "function"
+  ) {
+    return;
+  }
+  hookRunner
+    .runAfterToolCall(event, ctx)
+    .catch((err: unknown) =>
+      logWarn(`[tools] after_tool_call hook error for ${normalizedName}: ${String(err)}`),
+    );
+}
+
+export function toToolDefinitions(
+  tools: AnyAgentTool[],
+  hookCtx?: ToolDefinitionHookContext,
+): ToolDefinition[] {
   return tools.map((tool) => {
     const name = tool.name || "tool";
     const normalizedName = normalizeToolName(name);
@@ -92,8 +121,31 @@ export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
       parameters: tool.parameters,
       execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult<unknown>> => {
         const { toolCallId, params, onUpdate, signal } = splitToolExecuteArgs(args);
+        const startMs = Date.now();
+
+        // NOTE: before_tool_call is handled upstream by wrapToolWithBeforeToolCallHook
+        // in pi-tools.ts — the tool passed here is already wrapped. We only handle
+        // after_tool_call in this adapter.
+
         try {
-          return await tool.execute(toolCallId, params, signal, onUpdate);
+          const result = await tool.execute(toolCallId, params, signal, onUpdate);
+
+          fireAfterToolCall(
+            {
+              toolName: normalizedName,
+              params: params as Record<string, unknown>,
+              result: result?.details,
+              durationMs: Date.now() - startMs,
+            },
+            {
+              agentId: hookCtx?.agentId,
+              sessionKey: hookCtx?.sessionKey,
+              toolName: normalizedName,
+            },
+            normalizedName,
+          );
+
+          return result;
         } catch (err) {
           if (signal?.aborted) {
             throw err;
@@ -110,6 +162,22 @@ export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
             logDebug(`tools: ${normalizedName} failed stack:\n${described.stack}`);
           }
           logError(`[tools] ${normalizedName} failed: ${described.message}`);
+
+          fireAfterToolCall(
+            {
+              toolName: normalizedName,
+              params: params as Record<string, unknown>,
+              error: described.message,
+              durationMs: Date.now() - startMs,
+            },
+            {
+              agentId: hookCtx?.agentId,
+              sessionKey: hookCtx?.sessionKey,
+              toolName: normalizedName,
+            },
+            normalizedName,
+          );
+
           return jsonResult({
             status: "error",
             tool: normalizedName,
@@ -138,6 +206,9 @@ export function toClientToolDefinitions(
       parameters: func.parameters as any,
       execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult<unknown>> => {
         const { toolCallId, params } = splitToolExecuteArgs(args);
+        const startMs = Date.now();
+        const normalizedName = normalizeToolName(func.name);
+
         const outcome = await runBeforeToolCallHook({
           toolName: func.name,
           params,
@@ -154,11 +225,28 @@ export function toClientToolDefinitions(
           onClientToolCall(func.name, paramsRecord);
         }
         // Return a pending result - the client will execute this tool
-        return jsonResult({
+        const result = jsonResult({
           status: "pending",
           tool: func.name,
           message: "Tool execution delegated to client",
         });
+
+        fireAfterToolCall(
+          {
+            toolName: normalizedName,
+            params: paramsRecord,
+            result: result?.details,
+            durationMs: Date.now() - startMs,
+          },
+          {
+            agentId: hookContext?.agentId,
+            sessionKey: hookContext?.sessionKey,
+            toolName: normalizedName,
+          },
+          normalizedName,
+        );
+
+        return result;
       },
     } satisfies ToolDefinition;
   });
